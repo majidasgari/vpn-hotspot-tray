@@ -1,0 +1,197 @@
+#!/bin/bash
+# vpn-hotspot — share this machine's VPN tunnel with wifi clients.
+#
+# A second vif in AP mode on the same radio and the same channel as the wifi
+# station, so the machine keeps its own wifi while phones join the AP. Clients
+# are NATed onto whatever default route the machine has (the tunnel).
+#
+# Usage: vpn-hotspot up|down|status
+# Needs root (it creates a vif, runs hostapd/dnsmasq and writes nft/iptables).
+# Settings come from /etc/vpn-hotspot.env (KEY=value): IF, AP, SSID, PASS.
+set -u
+
+CONF=${VH_CONF:-/etc/vpn-hotspot.env}
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+AP=${AP:-ap0}                 # AP vif created on the station's phy
+SSID=${SSID:-VPN-Hotspot}
+NET=10.42.0.0/24
+GW=10.42.0.1
+HCONF=/etc/hostapd/vpn-hotspot.conf
+DCONF=/etc/vpn-hotspot-dnsmasq.conf
+HLPID=/run/vpn-hotspot-hostapd.pid
+DLPID=/run/vpn-hotspot-dnsmasq.pid
+REG=IR                        # world reg (country 00) marks 5GHz NO-IR; AP mode is refused there
+
+die() { echo "vpn-hotspot: $*" >&2; exit 1; }
+
+detect_if() {
+  nmcli -t -f DEVICE,TYPE,STATE dev status 2>/dev/null |
+    awk -F: -v ap="$AP" '$2=="wifi" && $3 ~ /^connected/ && $1!=ap {print $1; exit}'
+}
+
+IF=${IF:-}
+[ -n "$IF" ] || IF=$(detect_if)
+[ -n "$IF" ] || die "no connected wifi found — join a 2.4GHz network first (the AP shares its channel)"
+
+# seed the settings file once so the user has something to edit
+if [ ! -f "$CONF" ]; then
+  (umask 077; printf 'IF=%s\nAP=%s\nSSID=%s\n' "$IF" "$AP" "$SSID" >"$CONF")
+fi
+
+station_up() { nmcli -g GENERAL.STATE dev show "$IF" 2>/dev/null | grep -q '^100'; }
+
+wait_station() { local i; for i in $(seq 1 15); do station_up && return 0; sleep 1; done; return 1; }
+
+# fills freq chan width centr from the station
+read_station() {
+  local info; info=$(iw dev "$IF" info)
+  freq=$(sed -n 's/.*(\([0-9]*\) MHz).*/\1/p' <<<"$info" | head -1)
+  chan=$(sed -n 's/.*channel \([0-9]*\).*/\1/p' <<<"$info" | head -1)
+  width=$(sed -n 's/.*width: \([0-9]*\) MHz.*/\1/p' <<<"$info" | head -1)
+  centr=$(sed -n 's/.*center1: \([0-9]*\) MHz.*/\1/p' <<<"$info" | head -1)
+  [ -n "${freq:-}" ] && [ -n "${chan:-}" ] || die "cannot read the channel of $IF"
+}
+
+# password: config file, else whatever the current hostapd conf already uses
+# (so existing clients keep working), else a fresh random one, persisted.
+resolve_psk() {
+  [ -n "${PASS:-}" ] && { echo "$PASS"; return; }
+  if [ -r "$HCONF" ]; then
+    local old; old=$(sed -n 's/^wpa_passphrase=//p' "$HCONF" | head -1)
+    [ -n "$old" ] && { echo "$old"; return; }
+  fi
+  local new; new=$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 12)
+  (umask 077; echo "PASS=$new" >>"$CONF")
+  echo "$new"
+}
+
+up() {
+  station_up || die "wifi $IF is not connected — connect it first (the AP must share its channel)"
+  local freq chan width centr mode mac apmac extra="" pass
+  read_station
+  if [ "$freq" -ge 3000 ] && iw reg get 2>/dev/null | grep -q '^country 00'; then
+    iw reg set "$REG" || die "cannot set reg $REG"; sleep 2
+    wait_station || die "station did not come back after setting reg $REG"
+    read_station
+  fi
+  # same channel is mandatory (one radio); match the station's width as well
+  if [ "$freq" -lt 3000 ]; then
+    mode=g; extra='ieee80211n=1'
+  else
+    mode=a
+    case "${width:-20}" in
+      160) extra=$'ieee80211n=1\nieee80211ac=1\nvht_oper_chwidth=2' ;;
+      80)  extra=$'ieee80211n=1\nieee80211ac=1\nvht_oper_chwidth=1' ;;
+      40)  extra=$'ieee80211n=1\nht_capab=[HT40+]' ;;
+      *)   extra='ieee80211n=1' ;;
+    esac
+    [ -n "${centr:-}" ] && [ "${width:-20}" -ge 80 ] &&
+      extra+=$'\nvht_oper_centr_freq_seg0_idx='$(( (centr - 5000) / 5 ))
+  fi
+  pass=$(resolve_psk)
+  [ -n "$pass" ] || die "no PSK could be resolved"
+  install -d /etc/hostapd
+  cat >"$HCONF" <<EOF
+interface=$AP
+driver=nl80211
+ssid=$SSID
+hw_mode=$mode
+channel=$chan
+$extra
+wmm_enabled=1
+auth_algs=1
+wpa=2
+wpa_passphrase=$pass
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+EOF
+  # the AP vif inherits the phy MAC and the kernel refuses two UP ifaces with the
+  # same address (ENOTUNIQ) — give it a locally-administered copy
+  mac=$(sed -n 's/^[[:space:]]*addr \([0-9a-f:]*\)$/\1/p' <<<"$(iw dev "$IF" info)" | head -1)
+  [ -n "$mac" ] || die "cannot read the MAC of $IF"
+  apmac=$(printf '%02x' $(( 0x${mac%%:*} ^ 2 ))):${mac#*:}
+  iw dev "$AP" info >/dev/null 2>&1 || iw dev "$IF" interface add "$AP" type __ap ||
+    die "driver refused a second vif"
+  ip link set "$AP" down
+  ip link set "$AP" address "$apmac" || die "cannot set the MAC of $AP"
+  nmcli device set "$AP" managed no
+  ip addr replace "$GW/24" dev "$AP"
+  sysctl -qw "net.ipv4.conf.$AP.forwarding=1"
+  iptables -t nat -C POSTROUTING -s "$NET" ! -d "$NET" -j MASQUERADE 2>/dev/null ||
+    iptables -t nat -A POSTROUTING -s "$NET" ! -d "$NET" -j MASQUERADE
+  iptables -C FORWARD -i "$AP" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i "$AP" -j ACCEPT
+  iptables -C FORWARD -o "$AP" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
+    iptables -I FORWARD 1 -o "$AP" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  cat >"$DCONF" <<EOF
+listen-address=$GW
+bind-interfaces
+dhcp-range=10.42.0.10,10.42.0.254,255.255.255.0,1h
+dhcp-option=3,$GW
+dhcp-option=6,$GW
+dhcp-leasefile=/run/vpn-hotspot.leases
+pid-file=$DLPID
+server=127.0.0.53
+EOF
+  [ -f "$DLPID" ] && kill "$(cat "$DLPID")" 2>/dev/null && sleep 1
+  dnsmasq --conf-file="$DCONF" || die "dnsmasq failed"
+  [ -f "$HLPID" ] && kill "$(cat "$HLPID")" 2>/dev/null && sleep 1
+  hostapd -B -P "$HLPID" "$HCONF" >/dev/null 2>&1 ||
+    die "hostapd failed — debug with: hostapd -dd $HCONF"
+  # starting the AP can kick the station off the air once; NM usually re-associates
+  wait_station || nmcli device connect "$IF" >/dev/null 2>&1
+  sleep 2
+  kill -0 "$(cat "$HLPID" 2>/dev/null)" 2>/dev/null ||
+    die "hostapd exited right after start — debug with: hostapd -dd $HCONF"
+  echo "up: AP $SSID on $AP ch$chan (${width:-?}MHz), station $IF ch$chan"
+  station_up || echo "warn: the station did not re-associate — reconnect the wifi manually" >&2
+}
+
+# passwd <file-with-the-new-password>  (a file, not an argument, so the secret
+# never shows up in `ps`); restarts a running AP so the new key takes effect
+change_pass() {
+  local src=${1:-} new
+  if [ -n "$src" ]; then new=$(head -1 "$src"); rm -f "$src"; else IFS= read -r new; fi
+  case "$new" in
+    *[!A-Za-z0-9._-]*) die "use only letters, digits, dot, dash and underscore" ;;
+  esac
+  [ "${#new}" -ge 8 ] && [ "${#new}" -le 63 ] || die "password must be 8-63 characters"
+  if grep -q '^PASS=' "$CONF" 2>/dev/null; then
+    sed -i "s|^PASS=.*|PASS=$new|" "$CONF"
+  else
+    (umask 077; echo "PASS=$new" >>"$CONF")
+  fi
+  PASS=$new
+  if [ -f "$HLPID" ] && kill -0 "$(cat "$HLPID" 2>/dev/null)" 2>/dev/null; then
+    up || die "password saved, but the AP did not restart — run: $0 up"
+  else
+    echo "password saved (the AP is off; it will use it on the next start)"
+  fi
+}
+
+down() {
+  [ -f "$HLPID" ] && kill "$(cat "$HLPID")" 2>/dev/null; rm -f "$HLPID"
+  [ -f "$DLPID" ] && kill "$(cat "$DLPID")" 2>/dev/null; rm -f "$DLPID"
+  iptables -t nat -D POSTROUTING -s "$NET" ! -d "$NET" -j MASQUERADE 2>/dev/null
+  iptables -D FORWARD -i "$AP" -j ACCEPT 2>/dev/null
+  iptables -D FORWARD -o "$AP" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+  iw dev "$AP" del 2>/dev/null
+  echo "down"
+}
+
+status() {
+  echo "station $IF: $(iw dev "$IF" link 2>/dev/null | head -1)"
+  iw dev "$AP" info 2>/dev/null | sed -n 's/^/AP: /p' | grep -E "ssid|type|channel"
+  echo "vpn route: $(ip route get 8.8.8.8 2>/dev/null | head -1)"
+  echo "leases:"; cat /run/vpn-hotspot.leases 2>/dev/null || echo "  (none)"
+  ip route get 8.8.8.8 from 10.42.0.2 2>/dev/null | head -1
+}
+
+case "${1:-status}" in
+  up) up ;;
+  down) down ;;
+  passwd|pass) change_pass "${2:-}" ;;
+  status) status ;;
+  *) die "usage: $0 up|down|passwd <file>|status" ;;
+esac
